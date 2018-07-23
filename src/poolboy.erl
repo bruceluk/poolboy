@@ -189,9 +189,13 @@ handle_call({checkout, CRef, Block}, {FromPid, _} = From, State) ->
             true = ets:insert(Monitors, {Pid, CRef, MRef}),
             {reply, Pid, State#state{workers = Left}};
         [] when MaxOverflow > 0, Overflow < MaxOverflow ->
-            {Pid, MRef} = new_worker(Sup, FromPid),
-            true = ets:insert(Monitors, {Pid, CRef, MRef}),
-            {reply, Pid, State#state{overflow = Overflow + 1}};
+            case new_worker(Sup, FromPid) of
+				{Pid, MRef} when is_pid(Pid) ->
+					true = ets:insert(Monitors, {Pid, CRef, MRef}),
+					{reply, Pid, State#state{overflow = Overflow + 1}};
+				{error, Reason} ->
+					{reply, full, State}
+			end;
         [] when Block =:= false ->
             {reply, full, State};
         [] ->
@@ -246,7 +250,12 @@ handle_info({'EXIT', Pid, _Reason}, State) ->
             case lists:member(Pid, State#state.workers) of
                 true ->
                     W = lists:filter(fun (P) -> P =/= Pid end, State#state.workers),
-                    {noreply, State#state{workers = [new_worker(Sup) | W]}};
+					case new_worker(Sup) of
+						NewPid when is_pid(NewPid) ->
+							{noreply, State#state{workers = [NewPid | W]}};
+						{error, Reason} ->
+							{noreply, State}
+					end;
                 false ->
                     {noreply, State}
             end
@@ -272,14 +281,22 @@ start_pool(StartFun, PoolArgs, WorkerArgs) ->
     end.
 
 new_worker(Sup) ->
-    {ok, Pid} = supervisor:start_child(Sup, []),
-    true = link(Pid),
-    Pid.
+    case supervisor:start_child(Sup, []) of
+		{ok, Pid} ->
+			true = link(Pid),
+			Pid;
+		{error, Reason} ->
+			{error, Reason}
+	end.
 
 new_worker(Sup, FromPid) ->
-    Pid = new_worker(Sup),
-    Ref = erlang:monitor(process, FromPid),
-    {Pid, Ref}.
+    case new_worker(Sup) of
+		Pid when is_pid(Pid) ->
+			Ref = erlang:monitor(process, FromPid),
+			{Pid, Ref};
+		{error, Reason} ->
+			{error, Reason}
+	end.
 
 dismiss_worker(Sup, Pid) ->
     true = unlink(Pid),
@@ -293,7 +310,12 @@ prepopulate(N, Sup) ->
 prepopulate(0, _Sup, Workers) ->
     Workers;
 prepopulate(N, Sup, Workers) ->
-    prepopulate(N-1, Sup, [new_worker(Sup) | Workers]).
+	case new_worker(Sup) of
+		Pid when is_pid(Pid) ->
+			prepopulate(N-1, Sup, [Pid | Workers]);
+		{error, Reason} ->
+			Workers
+	end.
 
 handle_checkin(Pid, State) ->
     #state{supervisor = Sup,
@@ -323,16 +345,24 @@ handle_worker_exit(Pid, State) ->
            overflow = Overflow} = State,
     case queue:out(State#state.waiting) of
         {{value, {From, CRef, MRef}}, LeftWaiting} ->
-            NewWorker = new_worker(State#state.supervisor),
-            true = ets:insert(Monitors, {NewWorker, CRef, MRef}),
-            gen_server:reply(From, NewWorker),
-            State#state{waiting = LeftWaiting};
+            case new_worker(State#state.supervisor) of
+				NewWorker when is_pid(NewWorker) ->
+					true = ets:insert(Monitors, {NewWorker, CRef, MRef}),
+					gen_server:reply(From, NewWorker),
+					State#state{waiting = LeftWaiting};
+				{error, Reason} ->
+					State
+			end;
         {empty, Empty} when Overflow > 0 ->
             State#state{overflow = Overflow - 1, waiting = Empty};
         {empty, Empty} ->
             Workers =
-                [new_worker(Sup)
-                 | lists:filter(fun (P) -> P =/= Pid end, State#state.workers)],
+				case new_worker(Sup) of
+					NewWorker when is_pid(NewWorker) ->
+						[NewWorker | lists:filter(fun (P) -> P =/= Pid end, State#state.workers)];
+					{error, Reason} ->
+						lists:filter(fun (P) -> P =/= Pid end, State#state.workers)
+				end,
             State#state{workers = Workers, waiting = Empty}
     end.
 
